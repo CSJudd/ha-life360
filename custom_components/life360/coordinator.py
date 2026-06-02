@@ -32,6 +32,7 @@ from .const import (
     LTD_LOGIN_ERROR_RETRY_DELAY,
     MAX_LTD_LOGIN_ERROR_RETRIES,
     SIGNAL_ACCT_STATUS,
+    BULK_UPDATE_INTERVAL,
     UPDATE_INTERVAL,
 )
 from .helpers import (
@@ -708,6 +709,56 @@ class CirclesMembersDataUpdateCoordinator(DataUpdateCoordinator[CirclesMembersDa
             acct.failed_task.cancel()
 
 
+
+
+class BulkMemberDataUpdateCoordinator(DataUpdateCoordinator[dict]):
+    """Shared bulk-fetch coordinator: one poll per circle, all members returned."""
+
+    config_entry: "L360ConfigEntry"
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: "L360ConfigEntry",
+        circles_coordinator: "CirclesMembersDataUpdateCoordinator",
+    ) -> None:
+        """Initialize bulk member data coordinator."""
+        super().__init__(
+            hass,
+            _LOGGER,
+            config_entry=entry,
+            name="Bulk Member Data",
+            update_interval=BULK_UPDATE_INTERVAL,
+            always_update=False,
+        )
+        # Shared cache: {(cid, mid): raw_member_dict | RequestError}
+        self.data: dict[tuple[CircleID, MemberID], dict[str, Any] | RequestError] = {}
+        self._circles_coordinator = circles_coordinator
+
+    async def _async_update_data(
+        self,
+    ) -> dict[tuple[CircleID, MemberID], dict[str, Any] | RequestError]:
+        """Fetch all member locations via bulk circle-members endpoint."""
+        circles = self._circles_coordinator.data.circles
+        cache: dict[tuple[CircleID, MemberID], dict[str, Any] | RequestError] = {}
+
+        for cid, circle_data in circles.items():
+            raw_members = await self._circles_coordinator._get_raw_members_list(
+                {cid: circle_data}
+            )
+            result = raw_members[0]
+            if isinstance(result, RequestError):
+                # Preserve previous cache entries for this circle on error
+                for (old_cid, old_mid), old_val in self.data.items():
+                    if old_cid == cid:
+                        cache[(cid, old_mid)] = old_val
+            else:
+                for raw_member in result:
+                    mid = MemberID(raw_member["id"])
+                    cache[(cid, mid)] = raw_member
+
+        return cache
+
 class MemberDataUpdateCoordinator(DataUpdateCoordinator[MemberData]):
     """Member data update coordinator."""
 
@@ -718,6 +769,7 @@ class MemberDataUpdateCoordinator(DataUpdateCoordinator[MemberData]):
         hass: HomeAssistant,
         entry: L360ConfigEntry,
         mid: MemberID,
+        bulk_coordinator: "BulkMemberDataUpdateCoordinator",
     ) -> None:
         """Initialize data update coordinator."""
         coordinator = entry.runtime_data.coordinator
@@ -733,6 +785,7 @@ class MemberDataUpdateCoordinator(DataUpdateCoordinator[MemberData]):
         self.data = MemberData(mem_details)
         self._coordinator = coordinator
         self._mid = mid
+        self._bulk_coordinator = bulk_coordinator
         self._member_data: dict[CircleID, MemberData] = {}
 
     async def update_location(self) -> None:
@@ -740,10 +793,20 @@ class MemberDataUpdateCoordinator(DataUpdateCoordinator[MemberData]):
         await self._coordinator.update_member_location(self._mid)
 
     async def _async_update_data(self) -> MemberData:
-        """Fetch the latest data from the source."""
-        raw_member_data = await self._coordinator.get_raw_member_data(self._mid)
+        """Fetch the latest data from bulk cache."""
+        mid = self._mid
+        circles = self._coordinator.data.circles
+        bulk = self._bulk_coordinator.data
+
+        # Build raw_member_data from shared bulk cache
+        raw_member_data: dict[CircleID, dict[str, Any] | RequestError] = {
+            cid: bulk.get((cid, mid), RequestError.NO_DATA)
+            for cid in circles
+            if mid in circles[cid].mids
+        }
+
         # Member may no longer be available, but we haven't been removed yet.
-        if raw_member_data is None:
+        if not raw_member_data:
             return self.data
 
         member_data: dict[CircleID, MemberData] = {}
@@ -794,6 +857,7 @@ class L360Coordinators:
     """Life360 data update coordinators."""
 
     coordinator: CirclesMembersDataUpdateCoordinator
+    bulk_coordinator: BulkMemberDataUpdateCoordinator
     mem_coordinator: dict[MemberID, MemberDataUpdateCoordinator]
 
 

@@ -30,6 +30,7 @@ from .const import (
 from .coordinator import (
     CirclesMembersDataUpdateCoordinator,
     L360ConfigEntry,
+    BulkMemberDataUpdateCoordinator,
     L360Coordinators,
     MemberDataUpdateCoordinator,
 )
@@ -87,8 +88,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: L360ConfigEntry) -> bool
 
     coordinator = CirclesMembersDataUpdateCoordinator(hass, entry, store)
     await coordinator.async_config_entry_first_refresh()
+    bulk_coordinator = BulkMemberDataUpdateCoordinator(hass, entry, coordinator)
+    await bulk_coordinator.async_config_entry_first_refresh()
     mem_coordinator: dict[MemberID, MemberDataUpdateCoordinator] = {}
-    entry.runtime_data = L360Coordinators(coordinator, mem_coordinator)
+    entry.runtime_data = L360Coordinators(coordinator, bulk_coordinator, mem_coordinator)
 
     async def async_process_data() -> None:
         """Process Members."""
@@ -98,7 +101,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: L360ConfigEntry) -> bool
             for mid in set(mem_coordinator) - mids
         ]
         for mid in mids - set(mem_coordinator):
-            mem_crd = MemberDataUpdateCoordinator(hass, entry, mid)
+            mem_crd = MemberDataUpdateCoordinator(hass, entry, mid, bulk_coordinator)
             mem_coordinator[mid] = mem_crd
             coros.append(mem_crd.async_refresh())
         if coros:
@@ -130,6 +133,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: L360ConfigEntry) -> boo
     # them a chance to shutdown the background tasks themselves.
     await asyncio.gather(
         entry.runtime_data.coordinator.async_shutdown(),
+        entry.runtime_data.bulk_coordinator.async_shutdown(),
         *(
             mem_crd.async_shutdown()
             for mem_crd in entry.runtime_data.mem_coordinator.values()
