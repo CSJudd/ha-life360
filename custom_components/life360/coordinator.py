@@ -184,6 +184,41 @@ class CirclesMembersDataUpdateCoordinator(DataUpdateCoordinator[CirclesMembersDa
         )
         return dict(zip(cids, raw_member_list, strict=True))
 
+    async def get_bulk_member_data(
+        self,
+    ) -> dict[tuple[CircleID, MemberID], dict[str, Any] | RequestError]:
+        """Fetch all member location data via bulk circle-members endpoints.
+
+        Calls get_circle_members once per circle directly, bypassing the circles
+        update coordinator to avoid triggering roster refreshes.
+        Returns {(cid, mid): raw_member_dict | RequestError}.
+        """
+        circles = self.data.circles
+        if not circles:
+            return {}
+
+        cache: dict[tuple[CircleID, MemberID], dict[str, Any] | RequestError] = {}
+
+        for cid, circle_data in circles.items():
+            raw_members: list[dict[str, Any]] | RequestError = RequestError.NO_DATA
+            for aid in circle_data.aids:
+                result = await self._request(
+                    aid,
+                    self._acct_data[aid].api.get_circle_members,
+                    cid,
+                    msg=f"bulk fetch for {circle_data.name} Circle",
+                )
+                if not isinstance(result, RequestError):
+                    raw_members = result
+                    break
+            if isinstance(raw_members, RequestError):
+                continue
+            for raw_member in raw_members:
+                mid = MemberID(raw_member["id"])
+                cache[(cid, mid)] = raw_member
+
+        return cache
+
     def _data_from_store(self) -> CirclesMembersData:
         """Get Circles & Members from storage."""
         if not self._store.loaded_ok:
@@ -712,7 +747,7 @@ class CirclesMembersDataUpdateCoordinator(DataUpdateCoordinator[CirclesMembersDa
 
 
 class BulkMemberDataUpdateCoordinator(DataUpdateCoordinator[dict]):
-    """Shared bulk-fetch coordinator: one poll per circle, all members returned."""
+    """Shared bulk-fetch coordinator: fetches all members per circle in one call per circle."""
 
     config_entry: "L360ConfigEntry"
 
@@ -739,25 +774,18 @@ class BulkMemberDataUpdateCoordinator(DataUpdateCoordinator[dict]):
         self,
     ) -> dict[tuple[CircleID, MemberID], dict[str, Any] | RequestError]:
         """Fetch all member locations via bulk circle-members endpoint."""
-        circles = self._circles_coordinator.data.circles
-        cache: dict[tuple[CircleID, MemberID], dict[str, Any] | RequestError] = {}
+        try:
+            _LOGGER.debug("Bulk Member Data: starting fetch")
+            cache = await self._circles_coordinator.get_bulk_member_data()
+            if not cache:
+                _LOGGER.debug("Bulk Member Data: empty result, keeping previous cache")
+                return self.data
+            _LOGGER.debug("Bulk Member Data: cache built with %d entries", len(cache))
+            return cache
+        except Exception as err:
+            _LOGGER.error("Bulk Member Data: unexpected error: %s", err, exc_info=True)
+            return self.data
 
-        for cid, circle_data in circles.items():
-            raw_members = await self._circles_coordinator._get_raw_members_list(
-                {cid: circle_data}
-            )
-            result = raw_members[0]
-            if isinstance(result, RequestError):
-                # Preserve previous cache entries for this circle on error
-                for (old_cid, old_mid), old_val in self.data.items():
-                    if old_cid == cid:
-                        cache[(cid, old_mid)] = old_val
-            else:
-                for raw_member in result:
-                    mid = MemberID(raw_member["id"])
-                    cache[(cid, mid)] = raw_member
-
-        return cache
 
 class MemberDataUpdateCoordinator(DataUpdateCoordinator[MemberData]):
     """Member data update coordinator."""

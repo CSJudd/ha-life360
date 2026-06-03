@@ -17,6 +17,8 @@ import voluptuous as vol
 
 from homeassistant.const import CONF_ENTITY_ID, ENTITY_MATCH_ALL, Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
+from datetime import timedelta
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.typing import ConfigType
@@ -120,6 +122,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: L360ConfigEntry) -> bool
 
     process_data()
     entry.async_on_unload(coordinator.async_add_listener(process_data))
+    # Drive bulk coordinator via time interval since no entities subscribe to it directly
+    async def _bulk_refresh(_now=None) -> None:
+        await bulk_coordinator.async_refresh()
+
+    entry.async_on_unload(
+        async_track_time_interval(hass, _bulk_refresh, timedelta(seconds=10))
+    )
     return True
 
 
